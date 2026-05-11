@@ -1,0 +1,258 @@
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from typing import List, Optional
+import logging
+import os
+import time
+from datetime import datetime
+
+from ksl_search_final import KSLSearchFinal
+
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI with metadata
+app = FastAPI(
+    title="KSL Glosser API",
+    description="Semantic search for Kenyan Sign Language glossification",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    contact={
+        "name": "SignVrse Team",
+        "email": "support@signvrse.com"
+    }
+)
+
+# CORS middleware - configure for production
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Update with specific domains in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Request/Response models
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=500, description="English sentence to search")
+    top_k: int = Field(default=5, ge=1, le=20, description="Number of results to return")
+
+class SearchResult(BaseModel):
+    english: str = Field(..., description="Original English sentence")
+    ksl: str = Field(..., description="KSL gloss translation")
+    context: str = Field(..., description="Context category")
+    distance: float = Field(..., description="Semantic distance (lower = more similar)")
+
+class SearchResponse(BaseModel):
+    query: str
+    results: List[SearchResult]
+    count: int
+    latency_ms: float
+
+class HealthResponse(BaseModel):
+    status: str
+    model: str
+    glosses: int
+    timestamp: str
+    environment: str
+
+class StatsResponse(BaseModel):
+    total_glosses: int
+    model: str
+    embedding_dim: int
+    version: str
+
+# Global search component
+searcher = None
+startup_time = None
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize search component on startup"""
+    global searcher, startup_time
+    startup_time = datetime.now()
+    
+    logger.info("="*60)
+    logger.info("KSL Glosser API - Starting up")
+    logger.info("="*60)
+    
+    try:
+        # Initialize search component (CPU for Cloud Run)
+        logger.info("Loading sentence transformer model...")
+        searcher = KSLSearchFinal(
+            model_name='paraphrase-MiniLM-L3-v2',
+            device='cpu'
+        )
+        
+        # Load dataset
+        logger.info("Loading dataset...")
+        import pandas as pd
+        data = pd.read_csv('ksl_data_production.csv')
+        
+        # Load pre-built FAISS index
+        logger.info("Loading FAISS index...")
+        import faiss
+        searcher.index = faiss.read_index('ksl_search_production.index')
+        searcher.data = data
+        
+        logger.info(f"Search component initialized with {len(data):,} glosses")
+        logger.info("="*60)
+        logger.info("API ready to accept requests")
+        logger.info("="*60)
+        
+    except Exception as e:
+        logger.error(f"CRITICAL: Failed to initialize search component: {e}")
+        raise
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    logger.info("Shutting down KSL Glosser API...")
+
+# Middleware for request logging
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all requests"""
+    start_time = time.time()
+    
+    # Process request
+    response = await call_next(request)
+    
+    # Calculate duration
+    duration = (time.time() - start_time) * 1000
+    
+    # Log
+    logger.info(
+        f"{request.method} {request.url.path} - "
+        f"Status: {response.status_code} - "
+        f"Duration: {duration:.2f}ms"
+    )
+    
+    return response
+
+# Exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler"""
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "detail": str(exc) if os.getenv("ENVIRONMENT") != "production" else "An error occurred"
+        }
+    )
+
+# Endpoints
+@app.get("/", tags=["Root"])
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "service": "KSL Glosser API",
+        "version": "1.0.0",
+        "status": "running",
+        "documentation": "/docs",
+        "health": "/health",
+        "endpoints": {
+            "search": "POST /search",
+            "stats": "GET /stats"
+        }
+    }
+
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+async def health():
+    """
+    Health check endpoint
+    
+    Returns service health status and basic metrics.
+    Used by Cloud Run for health checks.
+    """
+    return HealthResponse(
+        status="healthy",
+        model="paraphrase-MiniLM-L3-v2",
+        glosses=len(searcher.data) if searcher and searcher.data is not None else 0,
+        timestamp=datetime.now().isoformat(),
+        environment=os.getenv("ENVIRONMENT", "development")
+    )
+
+@app.post("/search", response_model=SearchResponse, tags=["Search"])
+async def search(request: SearchRequest):
+    """
+    Search for similar KSL glosses
+    
+    Performs semantic search over the KSL database to find similar
+    English sentences and returns their KSL translations.
+    
+    - **query**: English sentence to search (1-500 characters)
+    - **top_k**: Number of results to return (1-20, default: 5)
+    
+    Returns the most semantically similar KSL glosses with distance scores.
+    Lower distance = more similar.
+    """
+    start_time = time.time()
+    
+    try:
+        if not searcher:
+            raise HTTPException(
+                status_code=503,
+                detail="Search component not initialized"
+            )
+        
+        # Perform search
+        results = searcher.search(request.query, top_k=request.top_k)
+        
+        # Calculate latency
+        latency = (time.time() - start_time) * 1000
+        
+        logger.info(
+            f"Search completed - Query: '{request.query[:50]}...' - "
+            f"Results: {len(results)} - Latency: {latency:.2f}ms"
+        )
+        
+        return SearchResponse(
+            query=request.query,
+            results=results,
+            count=len(results),
+            latency_ms=round(latency, 2)
+        )
+    
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Search failed: {str(e)}"
+        )
+
+@app.get("/stats", response_model=StatsResponse, tags=["Stats"])
+async def stats():
+    """
+    Get API statistics
+    
+    Returns information about the search database and model configuration.
+    """
+    return StatsResponse(
+        total_glosses=len(searcher.data) if searcher and searcher.data is not None else 0,
+        model="paraphrase-MiniLM-L3-v2",
+        embedding_dim=384,
+        version="1.0.0"
+    )
+
+# For local testing
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=True,
+        log_level="info"
+    )

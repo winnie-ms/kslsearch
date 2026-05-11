@@ -1,0 +1,70 @@
+# Cloud Build Configuration for KSL Glosser
+# Automates build, push, and deploy to Cloud Run
+
+steps:
+  # Step 1: Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-image'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/ksl-glosser:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/ksl-glosser:latest'
+      - '.'
+    timeout: 1200s
+
+  # Step 2: Push the container image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-image'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/ksl-glosser:$COMMIT_SHA'
+    waitFor: ['build-image']
+
+  # Step 3: Push latest tag
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-latest'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/ksl-glosser:latest'
+    waitFor: ['build-image']
+
+  # Step 4: Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-cloud-run'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'ksl-glosser'
+      - '--image=gcr.io/$PROJECT_ID/ksl-glosser:$COMMIT_SHA'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--memory=1Gi'
+      - '--cpu=1'
+      - '--max-instances=10'
+      - '--min-instances=0'
+      - '--timeout=60s'
+      - '--concurrency=80'
+      - '--set-env-vars=ENVIRONMENT=production'
+    waitFor: ['push-image']
+
+# Images to be pushed to Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/ksl-glosser:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/ksl-glosser:latest'
+
+# Build timeout
+timeout: 1800s
+
+# Build options
+options:
+  machineType: 'N1_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+
+# Substitutions (can be overridden)
+substitutions:
+  _REGION: 'us-central1'
+  _SERVICE_NAME: 'ksl-glosser'
